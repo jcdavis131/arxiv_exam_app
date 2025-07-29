@@ -907,7 +907,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# Mount static files only if not running on Vercel
-if not os.getenv("VERCEL"):
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")

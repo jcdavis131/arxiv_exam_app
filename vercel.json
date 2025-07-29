@@ -12,13 +12,16 @@
   ],
   "routes": [
     {
+      "src": "/api/(.*)",
+      "dest": "arxiv_exam_app.py"
+    },
+    {
       "src": "/static/(.*)",
-      "dest": "/static/$1",
-      "continue": true
+      "dest": "/static/$1"
     },
     {
       "src": "/(.*)",
-      "dest": "arxiv_exam_app.py"
+      "dest": "/static/index.html"
     }
   ],
   "env": {
