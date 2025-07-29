@@ -1,24 +1,28 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "static/**",
-      "use": "@vercel/static"
-    },
+
     {
       "src": "arxiv_exam_app.py",
       "use": "@vercel/python",
-      "config": { "maxLambdaSize": "15mb", "runtime": "python3.11" }
+      "config": {
+        "excludeFiles": "{**/*.py[cod],**/__pycache__/**,tests/**,scripts/**,examples/**,docs/**}"
+      }
     }
   ],
   "routes": [
     {
-      "src": "/api/(.*)",
-      "dest": "arxiv_exam_app.py"
+      "src": "/static/(.*)",
+      "dest": "/static/$1",
+      "continue": true
     },
     {
       "src": "/(.*)",
-      "dest": "static/$1"
+      "dest": "arxiv_exam_app.py"
     }
-  ]
+  ],
+  "env": {
+    "ENVIRONMENT": "production",
+    "LOG_LEVEL": "INFO"
+  }
 }
