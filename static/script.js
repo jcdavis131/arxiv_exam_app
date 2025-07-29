@@ -611,7 +611,7 @@ class ExamApp {
             }
 
             // Request split generation: 7 MC + 3 OE questions
-            const response = await fetch(`/exam/${arxivId}?mc_questions=7&oe_questions=3&teacher_mode=false`, {
+            const response = await fetch(`/api/exam/${arxivId}?mc_questions=7&oe_questions=3&teacher_mode=false`, {
                 method: 'GET',
                 headers: {
                     'X-LLM-Provider': this.state.llmConfig.provider,

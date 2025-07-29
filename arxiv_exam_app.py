@@ -839,7 +839,7 @@ async def generate_questions(paper: ProcessedPaper, n_questions: int = 15, mc_qu
 # ---------------------------------------------------------------------------
 # API route
 # ---------------------------------------------------------------------------
-@app.get("/exam/{arxiv_id}", response_model=ExamResponse, tags=["Exam"])
+@app.get("/api/exam/{arxiv_id}", response_model=ExamResponse, tags=["Exam"])
 async def create_exam(
     request: Request,
     arxiv_id: str,
@@ -877,7 +877,8 @@ async def create_exam(
         raise HTTPException(status_code=500, detail="Internal error") from e
 
 # Static files and error handling
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+if not os.getenv("VERCEL"):
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 @app.exception_handler(Exception)
 async def handle_exception(_: Request, exc: Exception) -> Response:
