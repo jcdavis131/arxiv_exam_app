@@ -12,12 +12,13 @@
   ],
   "routes": [
     {
-      "src": "/(.*)",
-      "dest": "arxiv_exam_app.py"
+      "src": "/public/(.*)",
+      "dest": "/public/$1",
+      "continue": true
     },
     {
-      "src": "/public/(.*)",
-      "dest": "index.html"
+      "src": "/(.*)",
+      "dest": "arxiv_exam_app.py"
     }
   ],
   "env": {
