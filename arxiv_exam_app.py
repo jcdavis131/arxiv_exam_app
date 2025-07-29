@@ -886,9 +886,6 @@ async def create_exam(
         raise HTTPException(status_code=500, detail="Internal error") from e
 
 # Static files and error handling
-if not os.getenv("VERCEL"):
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
-
 @app.exception_handler(Exception)
 async def handle_exception(_: Request, exc: Exception) -> Response:
     logger.exception(f"Unhandled error: {exc}")
@@ -910,3 +907,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# Mount static files only if not running on Vercel
+if not os.getenv("VERCEL"):
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
