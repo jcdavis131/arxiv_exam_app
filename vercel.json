@@ -3,7 +3,7 @@
   "builds": [
 
     {
-      "src": "arxiv_exam_app.py",
+      "src": "main.py",
       "use": "@vercel/python",
       "config": {
         "excludeFiles": "{**/*.py[cod],**/__pycache__/**,tests/**,scripts/**,examples/**,docs/**}"
@@ -12,12 +12,17 @@
   ],
   "routes": [
     {
-      "src": "/api/(.*)",
-      "dest": "arxiv_exam_app.py"
+      "src": "/static/(.*)",
+      "dest": "/static/$1",
+      "continue": true
+    },
+    {
+      "src": "/(.*)",
+      "dest": "main.py"
     }
   ],
   "env": {
     "ENVIRONMENT": "production",
-    "LOG_LEVEL": "INFO"
+      "LOG_LEVEL": "INFO"
   }
 }
