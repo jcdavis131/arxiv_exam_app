@@ -13,7 +13,7 @@ class ExamApp {
             apiKey: document.getElementById('apiKey'),
             saveConfig: document.getElementById('saveConfig'),
             configStatus: document.getElementById('configStatus'),
-            downloadExamBtn: document.getElementById('downloadExamBtn')
+            downloadExamBtn: document.getElementById('downloadExamBtn'),
         };
         
         this.state = {
@@ -529,7 +529,7 @@ class ExamApp {
         // Add sample answer
         feedbackHtml += `
             <div class="sample-answer">
-                <div class="sample-answer-label">Sample Answer:</div>
+                <div class="sample-answer-label">Model Answer:</div>
                 <div>${question.sample_answer}</div>
             </div>
         `;
@@ -611,7 +611,7 @@ class ExamApp {
             }
 
             // Request split generation: 7 MC + 3 OE questions
-            const response = await fetch(`/api/exam/${arxivId}?mc_questions=7&oe_questions=3&teacher_mode=false`, {
+            const response = await fetch(`/api/exam/${arxivId}?mc_questions=7&oe_questions=3&teacher_mode=${this.state.teacherMode}`, {
                 method: 'GET',
                 headers: {
                     'X-LLM-Provider': this.state.llmConfig.provider,
@@ -675,50 +675,6 @@ class ExamApp {
         } finally {
             this.hideLoading();
         }
-    }
-
-    toggleTeacherMode() {
-        this.state.teacherMode = !this.state.teacherMode;
-        this.elements.teacherModeToggle.classList.toggle('active', this.state.teacherMode);
-        
-        // Update main container class for styling
-        const container = document.querySelector('.container');
-        container.classList.toggle('teacher-mode-active', this.state.teacherMode);
-        
-        // If exam is already loaded, update display
-        if (this.state.currentQuestions.length > 0) {
-            this.updateTeacherModeDisplay();
-        }
-    }
-
-    updateTeacherModeDisplay() {
-        if (this.state.teacherMode) {
-            this.showAllAnswers();
-        } else {
-            this.hideAllAnswers();
-        }
-    }
-
-    showAllAnswers() {
-        this.state.currentQuestions.forEach((question, index) => {
-            const questionDiv = document.querySelector(`[data-question-index="${index}"]`);
-            if (questionDiv) {
-                // Remove existing teacher answers
-                const existingTeacherAnswers = questionDiv.querySelector('.teacher-answers');
-                if (existingTeacherAnswers) {
-                    existingTeacherAnswers.remove();
-                }
-                
-                // Add teacher answers
-                const teacherAnswers = this.createTeacherAnswers(question);
-                questionDiv.appendChild(teacherAnswers);
-            }
-        });
-    }
-
-    hideAllAnswers() {
-        const teacherAnswers = document.querySelectorAll('.teacher-answers');
-        teacherAnswers.forEach(el => el.remove());
     }
 
     createTeacherAnswers(question) {

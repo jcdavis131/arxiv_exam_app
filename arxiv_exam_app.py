@@ -392,6 +392,15 @@ PROCESSING: {paper.processing_method.upper()} ({paper.total_chars:,} chars)
     
     content_text = '\n\n'.join(content_parts)
     
+    # Sanitize content_text to remove/replace problematic Unicode characters
+    # This is crucial for consistent encoding when sending to LLMs
+    try:
+        content_text = content_text.encode('utf-8', errors='replace').decode('utf-8')
+    except Exception as e:
+        logger.warning(f"Failed to sanitize content_text for LLM prompt: {e}")
+        # Fallback to a very basic ASCII if sanitation fails catastrophically
+        content_text = content_text.encode('ascii', errors='ignore').decode('ascii')
+
     if question_type == "multiple_choice":
         return f"{header}CONTENT:\n{content_text}\n\nGenerate {n_questions} multiple-choice questions covering key concepts, methods, and findings."
     elif question_type == "open_ended":

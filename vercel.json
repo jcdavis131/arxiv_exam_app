@@ -3,7 +3,7 @@
   "builds": [
     {
       "src": "static/**",
-      "use": "@vercel/static-build"
+      "use": "@vercel/static"
     },
     {
       "src": "arxiv_exam_app.py",
