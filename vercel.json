@@ -16,12 +16,8 @@
       "dest": "arxiv_exam_app.py"
     },
     {
-      "src": "/static/(.*)",
-      "dest": "/static/$1"
-    },
-    {
       "src": "/(.*)",
-      "dest": "/static/index.html"
+      "dest": "/index.html"
     }
   ],
   "env": {
