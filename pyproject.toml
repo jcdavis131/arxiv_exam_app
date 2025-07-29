@@ -1,0 +1,34 @@
+[project]
+name = "arxiv-exam-app"
+version = "1.0.0"
+description = "FastAPI service that turns any arXiv paper into a customised multiple-choice and open-ended question exam."
+authors = [{ name = "Cam Davis", email = "jcdavis131@gmail.com" }]
+license = { text = "MIT" }
+requires-python = ">=3.11"
+
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "httpx>=0.27",
+  "feedparser>=6.0",
+  "pydantic>=2.6",
+  "openai>=1.30",
+  "pypdf>=4.0",
+  "python-multipart>=0.0.6",
+  "aiofiles>=23.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.4",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "B", "I"]

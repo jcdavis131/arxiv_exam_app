@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(ruff check:*)",
+      "Bash(timeout:*)",
+      "Bash(grep:*)",
+      "Bash(PORT=8001 python arxiv_exam_app.py)",
+      "Bash(taskkill:*)",
+      "Bash(start python arxiv_exam_app.py)"
+    ],
+    "deny": []
+  }
+}
