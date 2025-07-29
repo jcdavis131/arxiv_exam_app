@@ -24,10 +24,11 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field, ValidationError
 from fastapi.staticfiles import StaticFiles
 import aiofiles
+from fastapi.templating import Jinja2Templates
 
 # Configuration Constants
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
@@ -159,6 +160,9 @@ app = FastAPI(
     license_info={"name": "MIT"},
     contact={"url": "https://github.com/jcdavis131/arxiv-exam-app"},
 )
+
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ---------------------------------------------------------------------------
 # Helper funcs – arXiv Processing
@@ -848,6 +852,10 @@ async def generate_questions(paper: ProcessedPaper, n_questions: int = 15, mc_qu
 # ---------------------------------------------------------------------------
 # API route
 # ---------------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
 @app.get("/api/exam/{arxiv_id}", response_model=ExamResponse, tags=["Exam"])
 async def create_exam(
     request: Request,
