@@ -53,4 +53,4 @@ MIT
 
 **Contact**
 
-For any inquiries or issues, please visit our GitHub repository: [https://github.com/jcdavis131/arxiv-exam-app](https://github.com/jcdavis131/arxiv-exam-app)
+For any inquiries or issues, please visit our GitHub repository: [https://github.com/jcdavis131/arxiv_exam_app](https://github.com/jcdavis131/arxiv_exam_app)
