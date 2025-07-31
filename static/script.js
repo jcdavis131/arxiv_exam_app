@@ -1,4 +1,4 @@
-// arXiv Exam Generator - Client-side functionality
+// arXiv Exam Generator - Client-side functionality with Search
 class ExamApp {
     constructor() {
         this.elements = {
@@ -14,13 +14,47 @@ class ExamApp {
             saveConfig: document.getElementById('saveConfig'),
             configStatus: document.getElementById('configStatus'),
             downloadExamBtn: document.getElementById('downloadExamBtn'),
+            downloadSinglePdfBtn: document.getElementById('downloadSinglePdfBtn'),
+            
+            // Search elements
+            modeButtons: document.querySelectorAll('.mode-btn'),
+            singlePaperMode: document.getElementById('singlePaperMode'),
+            searchMode: document.getElementById('searchMode'),
+            singlePaperInput: document.getElementById('singlePaperInput'),
+            searchInput: document.getElementById('searchInput'),
+            searchTabs: document.querySelectorAll('.search-tab'),
+            searchPanels: document.querySelectorAll('.search-panel'),
+            performSearchBtn: document.getElementById('performSearchBtn'),
+            searchResults: document.getElementById('searchResults'),
+            resultsList: document.getElementById('resultsList'),
+            generateFromSearchBtn: document.getElementById('generateFromSearchBtn'),
+            
+            // Search inputs
+            generalQuery: document.getElementById('generalQuery'),
+            generalSort: document.getElementById('generalSort'),
+            authorQuery: document.getElementById('authorQuery'),
+            authorSort: document.getElementById('authorSort'),
+            categorySelect: document.getElementById('categorySelect'),
+            categorySort: document.getElementById('categorySort'),
+            dateFrom: document.getElementById('dateFrom'),
+            dateTo: document.getElementById('dateTo'),
+            maxPapers: document.getElementById('maxPapers'),
+            mcQuestions: document.getElementById('mcQuestions'),
+            oeQuestions: document.getElementById('oeQuestions'),
+            examGenerationControls: document.querySelector('.exam-generation-controls'),
         };
         
         this.state = {
             currentQuestions: [],
+            currentExamData: null,
             examSubmitted: false,
             teacherMode: false,
-            llmConfig: this.loadConfig()
+            llmConfig: this.loadConfig(),
+            currentMode: 'single',
+            currentSearchType: 'general',
+            searchResults: [],
+            selectedPapers: [],
+            currentPage: 1
         };
         
         this.modelOptions = {
@@ -36,6 +70,7 @@ class ExamApp {
     init() {
         this.bindEvents();
         this.initializeConfig();
+        this.initializeSearch();
         this.elements.arxivInput.focus();
     }
 
@@ -147,6 +182,16 @@ class ExamApp {
         this.elements.arxivInput.addEventListener('input', () => this.hideError());
         this.elements.teacherModeToggle.addEventListener('click', () => this.toggleTeacherMode());
         
+        // PDF Download for single paper
+        this.elements.downloadSinglePdfBtn.addEventListener('click', () => {
+            const arxivId = this.elements.arxivInput.value.trim();
+            if (arxivId && this.validateArxivId(arxivId)) {
+                this.downloadPDF(arxivId);
+            } else {
+                this.showError('Please enter a valid arXiv paper ID.');
+            }
+        });
+        
         // LLM Configuration events
         this.elements.llmProvider.addEventListener('change', () => this.updateModelOptions());
         this.elements.saveConfig.addEventListener('click', () => this.saveConfig());
@@ -156,17 +201,8 @@ class ExamApp {
 
         // Download Exam events
         this.elements.downloadExamBtn.addEventListener('click', () => {
-            if (this.state.currentQuestions.length > 0) {
-                const dataStr = JSON.stringify(this.state.currentQuestions, null, 2);
-                const blob = new Blob([dataStr], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `exam_${this.elements.arxivInput.value.trim()}.json`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
+            if (this.state.currentQuestions.length > 0 && this.state.currentExamData) {
+                this.downloadEnhancedExam();
             } else {
                 alert('No exam data to download. Please generate an exam first.');
             }
@@ -204,6 +240,49 @@ class ExamApp {
         this.elements.generateBtn.disabled = false;
         this.elements.generateBtn.textContent = 'Generate Exam';
     }
+    
+    updateProgressSteps(isMultiPaper = false, mcQuestions = 7, oeQuestions = 3) {
+        const steps = [
+            {
+                single: "Fetching paper content",
+                multi: "Processing selected papers"
+            },
+            {
+                single: "Analyzing document structure", 
+                multi: "Downloading and analyzing papers"
+            },
+            {
+                single: "Processing with AI",
+                multi: "Combining content from multiple papers"
+            },
+            {
+                single: `Generating ${mcQuestions} multiple-choice questions`,
+                multi: `Generating ${mcQuestions} multiple-choice questions`
+            },
+            {
+                single: `Generating ${oeQuestions} open-ended questions`,
+                multi: `Generating ${oeQuestions} open-ended questions`
+            },
+            {
+                single: "Finalizing and shuffling answers",
+                multi: "Finalizing and shuffling answers"
+            },
+            {
+                single: "Naming exam",
+                multi: "Naming exam"
+            }
+        ];
+        
+        steps.forEach((step, index) => {
+            const stepElement = document.getElementById(`step${index + 1}`);
+            if (stepElement) {
+                const textElement = stepElement.querySelector('.step-text');
+                if (textElement) {
+                    textElement.textContent = isMultiPaper ? step.multi : step.single;
+                }
+            }
+        });
+    }
 
     resetProgressBar() {
         // Reset all progress elements
@@ -211,7 +290,7 @@ class ExamApp {
         document.getElementById('progressPercentage').textContent = '0%';
         
         // Reset all steps
-        for (let i = 1; i <= 6; i++) {
+        for (let i = 1; i <= 7; i++) {
             const step = document.getElementById(`step${i}`);
             step.classList.remove('active', 'completed');
         }
@@ -223,7 +302,7 @@ class ExamApp {
         document.getElementById('progressPercentage').textContent = `${percentage}%`;
         
         // Update steps
-        for (let i = 1; i <= 6; i++) {
+        for (let i = 1; i <= 7; i++) {
             const stepElement = document.getElementById(`step${i}`);
             stepElement.classList.remove('active', 'completed');
             
@@ -239,20 +318,41 @@ class ExamApp {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    createStatsBar(paperTitle, questionCount) {
+    createStatsBar(examData, questionCount) {
         const statsBar = document.createElement('div');
         statsBar.className = 'stats-bar';
+        
+        // Handle both string and object inputs for backward compatibility
+        const title = examData.exam_name || examData.metadata?.title || examData || 'Unknown Paper';
+        const paperTitle = examData.metadata?.title || title;
+        const citation = examData.metadata?.citation || '';
+        const examName = examData.exam_name || title;
+        
         const truncatedTitle = paperTitle.length > 60 ? 
             paperTitle.substring(0, 60) + '...' : paperTitle;
+        const truncatedExamName = examName.length > 50 ? 
+            examName.substring(0, 50) + '...' : examName;
         
         statsBar.innerHTML = `
-            <div class="stat">
-                <span class="stat-label">Paper:</span> 
-                <span class="stat-value">${truncatedTitle}</span>
+            <div class="exam-header">
+                <div class="stat exam-name">
+                    <span class="stat-label">Exam:</span> 
+                    <span class="stat-value exam-title">${truncatedExamName}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Questions:</span> 
+                    <span class="stat-value">${questionCount}</span>
+                </div>
             </div>
-            <div class="stat">
-                <span class="stat-label">Questions:</span> 
-                <span class="stat-value">${questionCount}</span>
+            <div class="paper-info">
+                <div class="stat">
+                    <span class="stat-label">Paper:</span> 
+                    <span class="stat-value">${truncatedTitle}</span>
+                </div>
+                ${citation ? `<div class="citation">
+                    <span class="stat-label">Citation:</span> 
+                    <span class="citation-text">${citation}</span>
+                </div>` : ''}
             </div>
         `;
         return statsBar;
@@ -588,6 +688,7 @@ class ExamApp {
         }
 
         this.showLoading();
+        this.updateProgressSteps(false, 7, 3); // Single paper mode
 
         try {
             // Step 1: Fetching paper content
@@ -602,7 +703,7 @@ class ExamApp {
             this.updateProgress(3, 30);
             await this.delay(400);
             
-            // Step 4: Generating 10 multiple-choice questions
+            // Step 4: Generating multiple-choice questions
             this.updateProgress(4, 50);
             
             // Validate API key
@@ -610,8 +711,8 @@ class ExamApp {
                 throw new Error('Please configure your API key in the LLM Configuration section above.');
             }
 
-            // Request split generation: 7 MC + 3 OE questions
-            const response = await fetch(`/api/exam/${arxivId}?mc_questions=7&oe_questions=3&teacher_mode=${this.state.teacherMode}`, {
+            // Start the request
+            const responsePromise = fetch(`/api/exam/${arxivId}?mc_questions=7&oe_questions=3&teacher_mode=${this.state.teacherMode}`, {
                 method: 'GET',
                 headers: {
                     'X-LLM-Provider': this.state.llmConfig.provider,
@@ -620,13 +721,22 @@ class ExamApp {
                 }
             });
             
-            // Step 5: Generating 5 open-ended questions (this happens during the fetch)
-            this.updateProgress(5, 80);
+            // Simulate MC question generation progress
+            await this.delay(800);
+            this.updateProgress(4, 65);
+            await this.delay(400);
             
+            // Step 5: Generating open-ended questions
+            this.updateProgress(5, 80);
+            await this.delay(600);
+            
+            // Wait for the actual response
+            const response = await responsePromise;
             const data = await response.json();
             
             // Step 6: Finalizing exam
-            this.updateProgress(6, 100);
+            this.updateProgress(6, 90);
+            await this.delay(400);
 
             if (!response.ok) {
                 throw new Error(data.detail || 'Failed to generate exam');
@@ -635,14 +745,19 @@ class ExamApp {
             if (!data || !data.questions || data.questions.length === 0) {
                 throw new Error('No questions generated. Paper might lack sufficient content.');
             }
+            
+            // Step 7: Naming exam
+            this.updateProgress(7, 100);
+            await this.delay(500);
 
-            // Store questions and render exam
+            // Store questions and full exam data 
             this.state.currentQuestions = data.questions; // Access questions from data.questions
+            this.state.currentExamData = data; // Store full exam data for download
             console.log(`Received ${data.questions.length} questions from API:`, data.questions);
             
-            const paperTitle = data.metadata.title || 'Unknown Paper'; // Access title from data.metadata.title
-            
-            this.elements.examContainer.appendChild(this.createStatsBar(paperTitle, data.questions.length));
+            // Clear exam container and add stats bar with full exam data
+            this.elements.examContainer.innerHTML = '';
+            this.elements.examContainer.appendChild(this.createStatsBar(data, data.questions.length));
             
             data.questions.forEach((question, index) => { // Iterate over data.questions
                 this.elements.examContainer.appendChild(this.renderQuestion(question, index));
@@ -760,6 +875,555 @@ class ExamApp {
             3: 'Satisfactory'
         };
         return labels[score] || 'Unknown';
+    }
+
+    // Search functionality
+    initializeSearch() {
+        // Mode toggle event listeners
+        this.elements.modeButtons.forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                this.switchMode(e.target.dataset.mode);
+            });
+        });
+
+        // Search tab event listeners
+        this.elements.searchTabs.forEach(tab => {
+            tab.addEventListener('click', (e) => {
+                this.switchSearchType(e.target.dataset.search);
+            });
+        });
+
+        // Search button listeners
+        this.elements.performSearchBtn.addEventListener('click', () => {
+            this.performSearch();
+        });
+
+        this.elements.generateFromSearchBtn.addEventListener('click', () => {
+            this.generateExamFromSearch();
+        });
+
+        // Enter key support for search inputs
+        [this.elements.generalQuery, this.elements.authorQuery].forEach(input => {
+            if (input) {
+                input.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') {
+                        this.performSearch();
+                    }
+                });
+            }
+        });
+    }
+
+    switchMode(mode) {
+        this.state.currentMode = mode;
+        
+        // Update button states
+        this.elements.modeButtons.forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.mode === mode);
+        });
+
+        // Show/hide appropriate content
+        this.elements.singlePaperMode.style.display = mode === 'single' ? 'block' : 'none';
+        this.elements.searchMode.style.display = mode === 'search' ? 'block' : 'none';
+        this.elements.examGenerationControls.style.display = mode === 'single' ? 'block' : 'none';
+        this.elements.searchInput.style.display = mode === 'search' ? 'block' : 'none';
+
+        // Clear any existing content
+        this.clearResults();
+    }
+
+    switchSearchType(searchType) {
+        this.state.currentSearchType = searchType;
+        
+        // Update tab states
+        this.elements.searchTabs.forEach(tab => {
+            tab.classList.toggle('active', tab.dataset.search === searchType);
+        });
+
+        // Show/hide appropriate panels
+        this.elements.searchPanels.forEach(panel => {
+            panel.classList.toggle('active', panel.id === searchType + 'Search');
+        });
+
+        // Clear results when switching search types
+        this.clearResults();
+    }
+
+    async performSearch() {
+        const searchType = this.state.currentSearchType;
+        let query, sortBy, endpoint;
+
+        try {
+            // Build search parameters based on type
+            switch (searchType) {
+                case 'general':
+                    query = this.elements.generalQuery.value.trim();
+                    sortBy = this.elements.generalSort.value;
+                    endpoint = `/api/search?q=${encodeURIComponent(query)}&sort_by=${sortBy}&max_results=20`;
+                    break;
+                
+                case 'author':
+                    query = this.elements.authorQuery.value.trim();
+                    sortBy = this.elements.authorSort.value;
+                    endpoint = `/api/search/author/${encodeURIComponent(query)}?sort_by=${sortBy}&max_results=20`;
+                    break;
+                
+                case 'category':
+                    const category = this.elements.categorySelect.value;
+                    if (!category) {
+                        this.showError('Please select a category');
+                        return;
+                    }
+                    sortBy = this.elements.categorySort.value;
+                    endpoint = `/api/search/category/${encodeURIComponent(category)}?sort_by=${sortBy}&max_results=20`;
+                    
+                    // Add date filters if provided
+                    const dateFrom = this.elements.dateFrom.value;
+                    const dateTo = this.elements.dateTo.value;
+                    if (dateFrom) endpoint += `&date_from=${dateFrom}`;
+                    if (dateTo) endpoint += `&date_to=${dateTo}`;
+                    break;
+                
+                default:
+                    this.showError('Invalid search type');
+                    return;
+            }
+
+            if (!query && searchType !== 'category') {
+                this.showError('Please enter a search query');
+                return;
+            }
+
+            // Show loading state
+            this.elements.performSearchBtn.disabled = true;
+            this.elements.performSearchBtn.textContent = 'Searching...';
+
+            // Perform search
+            const response = await fetch(endpoint);
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.detail || 'Search failed');
+            }
+
+            const data = await response.json();
+            this.state.searchResults = data.results;
+            this.displaySearchResults(data);
+
+        } catch (error) {
+            console.error('Search error:', error);
+            this.showError(error.message || 'Search failed. Please try again.');
+        } finally {
+            // Reset button state
+            this.elements.performSearchBtn.disabled = false;
+            this.elements.performSearchBtn.textContent = 'Search Papers';
+        }
+    }
+
+    displaySearchResults(data) {
+        if (!data.results || data.results.length === 0) {
+            this.elements.resultsList.innerHTML = '<div class="no-results">No papers found. Try a different search query.</div>';
+            this.elements.searchResults.style.display = 'block';
+            return;
+        }
+
+        let html = '';
+        data.results.forEach((result, index) => {
+            html += `
+                <div class="result-item" data-index="${index}" data-arxiv-id="${result.arxiv_id}">
+                    <div class="result-title">${result.title}</div>
+                    <div class="result-authors">${result.authors.join(', ')}</div>
+                    <div class="result-abstract">${result.abstract.substring(0, 300)}${result.abstract.length > 300 ? '...' : ''}</div>
+                    <div class="result-meta">
+                        <div class="result-categories">
+                            ${result.categories.map(cat => `<span class="category-tag">${cat}</span>`).join('')}
+                        </div>
+                        <div class="result-date">${result.published ? new Date(result.published).toLocaleDateString() : ''}</div>
+                    </div>
+                    <div class="result-actions">
+                        <button class="download-pdf-btn" data-arxiv-id="${result.arxiv_id}">
+                            📄 Download PDF
+                        </button>
+                    </div>
+                </div>
+            `;
+        });
+
+        this.elements.resultsList.innerHTML = html;
+        this.elements.searchResults.style.display = 'block';
+
+        // Add click listeners to result items
+        this.elements.resultsList.querySelectorAll('.result-item').forEach(item => {
+            item.addEventListener('click', () => {
+                this.togglePaperSelection(item);
+            });
+        });
+
+        // Add click listeners to download buttons
+        this.elements.resultsList.querySelectorAll('.download-pdf-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation(); // Prevent triggering result item click
+                const arxivId = btn.getAttribute('data-arxiv-id');
+                if (arxivId) {
+                    this.downloadPDF(arxivId);
+                }
+            });
+        });
+
+        // Papers are not auto-selected - users must manually select them
+    }
+
+    togglePaperSelection(item, forceSelect = false) {
+        const arxivId = item.dataset.arxivId;
+        const maxPapers = parseInt(this.elements.maxPapers.value);
+        
+        if (item.classList.contains('selected') && !forceSelect) {
+            // Deselect
+            item.classList.remove('selected');
+            this.state.selectedPapers = this.state.selectedPapers.filter(p => p.arxiv_id !== arxivId);
+        } else if (this.state.selectedPapers.length < maxPapers || forceSelect) {
+            // Select
+            item.classList.add('selected');
+            const result = this.state.searchResults.find(r => r.arxiv_id === arxivId);
+            if (result && !this.state.selectedPapers.find(p => p.arxiv_id === arxivId)) {
+                this.state.selectedPapers.push(result);
+            }
+        } else {
+            this.showError(`Maximum ${maxPapers} papers can be selected for exam generation.`);
+        }
+
+        // Update generate button state and text with count
+        const selectedCount = this.state.selectedPapers.length;
+        this.elements.generateFromSearchBtn.disabled = selectedCount === 0;
+        this.elements.generateFromSearchBtn.textContent = `Generate Exam from Selected (${selectedCount})`;
+    }
+
+    async generateExamFromSearch() {
+        if (this.state.selectedPapers.length === 0) {
+            this.showError('Please select at least one paper');
+            return;
+        }
+
+        if (!this.state.llmConfig.apiKey) {
+            this.showError('Please configure your LLM API key first');
+            return;
+        }
+
+        // Extract arXiv IDs from selected papers
+        const arxivIds = this.state.selectedPapers.map(paper => paper.arxiv_id);
+        
+        // Validate arXiv IDs
+        const invalidIds = arxivIds.filter(id => !id || !id.match(/^\d{4}\.\d{4,5}$/));
+        if (invalidIds.length > 0) {
+            this.showError(`Invalid arXiv IDs detected: ${invalidIds.join(', ')}. Please try searching again.`);
+            return;
+        }
+        
+        const payload = {
+            arxiv_ids: arxivIds,
+            mc_questions: parseInt(this.elements.mcQuestions.value),
+            oe_questions: parseInt(this.elements.oeQuestions.value),
+            exam_title: `Multi-Paper Exam: ${this.getCurrentSearchQuery()}`
+        };
+
+        const headers = {
+            'Content-Type': 'application/json',
+            'X-LLM-Provider': this.state.llmConfig.provider,
+            'X-LLM-Model': this.state.llmConfig.model,
+            'X-LLM-API-Key': this.state.llmConfig.apiKey
+        };
+
+        try {
+            this.showLoading();
+            this.updateProgressSteps(true, parseInt(this.elements.mcQuestions.value), parseInt(this.elements.oeQuestions.value)); // Multi-paper mode
+            this.elements.generateFromSearchBtn.disabled = true;
+            this.elements.generateFromSearchBtn.textContent = 'Generating Exam...';
+
+            // Multi-paper exam progress steps
+            // Step 1: Processing selected papers
+            this.updateProgress(1, 10);
+            await this.delay(300);
+            
+            // Step 2: Downloading and analyzing papers
+            this.updateProgress(2, 25);
+            await this.delay(400);
+            
+            // Step 3: Combining content from multiple papers
+            this.updateProgress(3, 40);
+            await this.delay(300);
+
+            // Start the request
+            const responsePromise = fetch('/api/exam/selected', {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify(payload)
+            });
+            
+            // Step 4: Generating multiple-choice questions
+            this.updateProgress(4, 55);
+            await this.delay(800);
+            this.updateProgress(4, 70);
+            await this.delay(400);
+            
+            // Step 5: Generating open-ended questions  
+            this.updateProgress(5, 85);
+            await this.delay(600);
+
+            // Wait for the actual response
+            const response = await responsePromise;
+            
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.detail || 'Failed to generate exam');
+            }
+
+            const examData = await response.json();
+            
+            // Step 6: Finalizing multi-paper exam
+            this.updateProgress(6, 90);
+            await this.delay(400);
+            
+            // Display the exam (same logic as generateExam)
+            if (!examData || !examData.questions || examData.questions.length === 0) {
+                throw new Error('No questions generated. Papers might lack sufficient content.');
+            }
+            
+            // Step 7: Naming exam
+            this.updateProgress(7, 100);
+            await this.delay(500);
+
+            // Store questions and full exam data
+            this.state.currentQuestions = examData.questions;
+            this.state.currentExamData = examData; // Store full exam data for download
+            console.log(`Received ${examData.questions.length} questions from multi-paper exam:`, examData.questions);
+            
+            const examTitle = examData.metadata.title || 'Multi-Paper Exam';
+            
+            // Clear and populate exam container
+            this.elements.examContainer.innerHTML = '';
+            this.elements.examContainer.appendChild(this.createStatsBar(examData, examData.questions.length));
+            
+            examData.questions.forEach((question, index) => {
+                this.elements.examContainer.appendChild(this.renderQuestion(question, index));
+            });
+
+            this.elements.examContainer.appendChild(this.createSubmitSection());
+
+            // Bind submit handler (only if not in teacher mode)
+            if (!this.state.teacherMode) {
+                const submitBtn = document.getElementById('submitExamBtn');
+                if (submitBtn) {
+                    submitBtn.addEventListener('click', () => this.submitExam());
+                }
+            }
+
+            // Show teacher answers if in teacher mode
+            if (this.state.teacherMode) {
+                this.showAllAnswers();
+            }
+            
+            // Show download button
+            this.elements.downloadExamBtn.style.display = 'block';
+
+        } catch (error) {
+            console.error('Exam generation error:', error);
+            
+            let errorMessage = error.message || 'Failed to generate exam. Please try again.';
+            
+            // Provide more helpful error messages based on common issues
+            if (errorMessage.includes('Failed to process any papers')) {
+                errorMessage += ' This might be due to invalid paper IDs or network issues. Try selecting different papers.';
+            } else if (errorMessage.includes('404')) {
+                errorMessage = 'Selected papers could not be found. Please try searching again and selecting different papers.';
+            } else if (errorMessage.includes('API key')) {
+                errorMessage = 'Please configure your LLM API key in the settings above.';
+            }
+            
+            this.showError(errorMessage);
+        } finally {
+            this.hideLoading();
+            this.elements.generateFromSearchBtn.disabled = false;
+            this.elements.generateFromSearchBtn.textContent = 'Generate Exam from Selected';
+        }
+    }
+
+    getCurrentSearchQuery() {
+        switch (this.state.currentSearchType) {
+            case 'general':
+                return this.elements.generalQuery.value.trim();
+            case 'author':
+                return `au:${this.elements.authorQuery.value.trim()}`;
+            case 'category':
+                return `cat:${this.elements.categorySelect.value}`;
+            default:
+                return '';
+        }
+    }
+
+    getCurrentSortBy() {
+        switch (this.state.currentSearchType) {
+            case 'general':
+                return this.elements.generalSort.value;
+            case 'author':
+                return this.elements.authorSort.value;
+            case 'category':
+                return this.elements.categorySort.value;
+            default:
+                return 'relevance';
+        }
+    }
+
+    clearResults() {
+        this.elements.searchResults.style.display = 'none';
+        this.elements.resultsList.innerHTML = '';
+        this.state.searchResults = [];
+        this.state.selectedPapers = [];
+        this.clearExam();
+    }
+
+    clearExam() {
+        this.elements.examContainer.innerHTML = '';
+        this.elements.errorContainer.innerHTML = '';
+        this.elements.downloadExamBtn.style.display = 'none';
+        this.state.currentQuestions = [];
+        this.state.currentExamData = null;
+        this.state.examSubmitted = false;
+    }
+
+    downloadEnhancedExam() {
+        try {
+            const examData = this.state.currentExamData;
+            const questions = this.state.currentQuestions;
+            
+            if (!examData || !questions) {
+                console.error('No exam data available for download');
+                return;
+            }
+
+            // Create comprehensive exam export with metadata
+            const exportData = {
+                // Exam metadata
+                exam_info: {
+                    exam_name: examData.exam_name || 'arXiv Exam',
+                    generated_date: new Date().toISOString(),
+                    generated_by: 'arXiv IQ - Research Paper Exam Generator',
+                    website: 'https://github.com/jcdavis131/arxiv-exam-app',
+                    llm_provider: this.state.llmConfig.provider || 'openai',
+                    llm_model: this.state.llmConfig.model || 'gpt-4o-mini',
+                    total_questions: questions.length,
+                    question_breakdown: {
+                        multiple_choice: questions.filter(q => q.type === 'multiple_choice').length,
+                        open_ended: questions.filter(q => q.type === 'open_ended').length
+                    }
+                },
+                
+                // Paper metadata and citation
+                source_paper: {
+                    title: examData.metadata.title,
+                    authors: examData.metadata.authors,
+                    arxiv_id: examData.metadata.arxiv_id,
+                    categories: examData.metadata.categories,
+                    published: examData.metadata.published,
+                    abstract: examData.metadata.abstract,
+                    citation: examData.metadata.citation
+                },
+                
+                // Full questions array
+                questions: questions,
+                
+                // Export metadata
+                export_info: {
+                    format_version: '1.0',
+                    exported_at: new Date().toISOString(),
+                    export_type: 'comprehensive_exam_data'
+                }
+            };
+
+            // Create filename based on exam name and paper ID
+            const paperIdentifier = examData.metadata.arxiv_id || 
+                                   this.elements.arxivInput.value.trim() || 
+                                   'exam';
+            const examName = examData.exam_name ? 
+                           examData.exam_name.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase() : 
+                           'arxiv_exam';
+            const timestamp = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+            const filename = `${examName}_${paperIdentifier}_${timestamp}.json`;
+
+            // Download the enhanced JSON
+            const dataStr = JSON.stringify(exportData, null, 2);
+            const blob = new Blob([dataStr], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            console.log(`Downloaded enhanced exam data as ${filename}`);
+
+        } catch (error) {
+            console.error('Error downloading exam data:', error);
+            alert('Failed to download exam data. Please try again.');
+        }
+    }
+
+    async downloadPDF(arxivId) {
+        try {
+            console.log(`Downloading PDF for ${arxivId}`);
+            
+            // Show loading state on the button
+            const downloadBtn = document.querySelector(`[data-arxiv-id="${arxivId}"].download-pdf-btn`);
+            if (downloadBtn) {
+                downloadBtn.disabled = true;
+                downloadBtn.textContent = '⏳ Downloading...';
+            }
+            
+            // Make request to download endpoint
+            const response = await fetch(`/api/download/${arxivId}`);
+            
+            if (!response.ok) {
+                throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+            }
+            
+            // Get the filename from response headers
+            const contentDisposition = response.headers.get('Content-Disposition');
+            let filename = `${arxivId}.pdf`;
+            if (contentDisposition) {
+                const filenameMatch = contentDisposition.match(/filename="(.+)"/);
+                if (filenameMatch) {
+                    filename = filenameMatch[1];
+                }
+            }
+            
+            // Create blob and download
+            const blob = await response.blob();
+            const downloadUrl = window.URL.createObjectURL(blob);
+            
+            // Create temporary download link
+            const downloadLink = document.createElement('a');
+            downloadLink.href = downloadUrl;
+            downloadLink.download = filename;
+            document.body.appendChild(downloadLink);
+            downloadLink.click();
+            document.body.removeChild(downloadLink);
+            
+            // Clean up object URL
+            window.URL.revokeObjectURL(downloadUrl);
+            
+            console.log(`Successfully downloaded ${filename}`);
+            
+        } catch (error) {
+            console.error('Download error:', error);
+            this.showError(`Failed to download PDF: ${error.message}`);
+        } finally {
+            // Reset button state
+            const downloadBtn = document.querySelector(`[data-arxiv-id="${arxivId}"].download-pdf-btn`);
+            if (downloadBtn) {
+                downloadBtn.disabled = false;
+                downloadBtn.textContent = '📄 Download PDF';
+            }
+        }
     }
 }
 

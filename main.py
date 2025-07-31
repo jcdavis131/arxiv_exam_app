@@ -15,14 +15,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import List, Literal, Optional, Dict, Any, Union
 from pathlib import Path
 
 import httpx
+import arxiv
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field, ValidationError
@@ -31,9 +34,6 @@ import aiofiles
 from fastapi.templating import Jinja2Templates
 
 # Configuration Constants
-ARXIV_API_URL = "https://export.arxiv.org/api/query"
-ARXIV_PDF_URL = "http://arxiv.org/pdf"
-ARXIV_TIMEOUT = 3.0
 MAX_QUESTIONS = 15
 MAX_PDF_SIZE = 50 * 1024 * 1024  # 50MB
 
@@ -110,7 +110,7 @@ class Choice(BaseModel):
 class MultipleChoiceQuestion(BaseModel):
     type: Literal["multiple_choice"] = "multiple_choice"
     prompt: str
-    choices: List[Choice] = Field(..., min_items=2)
+    choices: List[Choice] = Field(..., min_length=2)
     correct: str = Field(..., pattern="[A-Z]")
 
 
@@ -138,6 +138,8 @@ class PaperMetadata(BaseModel):
     abstract: str
     published: Optional[str] = None
     categories: List[str] = []
+    arxiv_id: Optional[str] = None
+    citation: Optional[str] = None
 
 
 class ProcessedPaper(BaseModel):
@@ -151,6 +153,48 @@ class ProcessedPaper(BaseModel):
 class ExamResponse(BaseModel):
     metadata: PaperMetadata
     questions: List[Question]
+    exam_name: Optional[str] = None
+
+
+# Search-related models
+class SearchResult(BaseModel):
+    """Single paper result from arXiv search."""
+    arxiv_id: str
+    title: str
+    authors: List[str]
+    abstract: str
+    published: Optional[str] = None
+    updated: Optional[str] = None
+    categories: List[str] = []
+    pdf_url: Optional[str] = None
+    entry_id: str
+
+
+class SearchResponse(BaseModel):
+    """Response for search endpoints."""
+    query: str
+    total_results: int
+    results: List[SearchResult]
+    page: int = 1
+    page_size: int = 20
+    has_more: bool = False
+
+
+class SearchExamRequest(BaseModel):
+    """Request model for generating exam from search results."""
+    query: str
+    max_papers: int = Field(default=3, ge=1, le=10, description="Number of papers to include in exam")
+    mc_questions: int = Field(default=10, ge=1, le=12, description="Number of multiple-choice questions")
+    oe_questions: int = Field(default=5, ge=1, le=8, description="Number of open-ended questions")
+    sort_by: Literal["relevance", "lastUpdatedDate", "submittedDate"] = "relevance"
+
+
+class SelectedPapersExamRequest(BaseModel):
+    """Request model for generating exam from specific selected papers."""
+    arxiv_ids: List[str] = Field(..., min_length=1, max_length=10, description="List of arXiv IDs to include")
+    mc_questions: int = Field(default=10, ge=1, le=12, description="Number of multiple-choice questions")
+    oe_questions: int = Field(default=5, ge=1, le=8, description="Number of open-ended questions")
+    exam_title: Optional[str] = Field(None, description="Custom title for the exam")
 
 # FastAPI Application
 app = FastAPI(
@@ -165,36 +209,153 @@ templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ---------------------------------------------------------------------------
+# Helper funcs – arXiv Processing & Search
+# ---------------------------------------------------------------------------
+def _convert_arxiv_result_to_search_result(paper: arxiv.Result) -> SearchResult:
+    """Convert arxiv.Result to SearchResult model."""
+    # Extract arXiv ID from entry_id (format: http://arxiv.org/abs/1234.5678v1)
+    arxiv_id = paper.entry_id.split('/')[-1]
+    
+    # More careful version number removal - only remove if it matches the pattern
+    import re
+    version_match = re.match(r'^(\d{4}\.\d{4,5})v\d+$', arxiv_id)
+    if version_match:
+        arxiv_id = version_match.group(1)
+    
+    logger.debug(f"Converted entry_id {paper.entry_id} to arxiv_id {arxiv_id}")
+    
+    return SearchResult(
+        arxiv_id=arxiv_id,
+        title=_normalize_whitespace(paper.title),
+        authors=[author.name for author in paper.authors],
+        abstract=_normalize_whitespace(paper.summary),
+        published=paper.published.isoformat() if paper.published else None,
+        updated=paper.updated.isoformat() if paper.updated else None,
+        categories=paper.categories,
+        pdf_url=paper.pdf_url,
+        entry_id=paper.entry_id
+    )
+
+
+def _get_sort_criterion(sort_by: str) -> arxiv.SortCriterion:
+    """Convert string sort parameter to arxiv.SortCriterion."""
+    sort_map = {
+        "relevance": arxiv.SortCriterion.Relevance,
+        "lastUpdatedDate": arxiv.SortCriterion.LastUpdatedDate,
+        "submittedDate": arxiv.SortCriterion.SubmittedDate
+    }
+    return sort_map.get(sort_by, arxiv.SortCriterion.Relevance)
+
+
+async def search_arxiv_papers(
+    query: str,
+    max_results: int = 20,
+    sort_by: str = "relevance",
+    start: int = 0
+) -> List[SearchResult]:
+    """Search arXiv papers using arxiv.py with pagination support."""
+    try:
+        client = arxiv.Client()
+        search = arxiv.Search(
+            query=query,
+            max_results=max_results,
+            sort_by=_get_sort_criterion(sort_by),
+            sort_order=arxiv.SortOrder.Descending
+        )
+        
+        results = []
+        for i, paper in enumerate(client.results(search)):
+            if i < start:
+                continue
+            if len(results) >= max_results:
+                break
+            results.append(_convert_arxiv_result_to_search_result(paper))
+        
+        return results
+    
+    except Exception as e:
+        logger.error(f"arXiv search error: {e}")
+        raise HTTPException(status_code=502, detail="arXiv search failed") from e
+
+
+# ---------------------------------------------------------------------------
 # Helper funcs – arXiv Processing
 # ---------------------------------------------------------------------------
-@lru_cache(maxsize=256)
-def _parse_arxiv_metadata(atom: str) -> PaperMetadata:
-    """Parse arXiv atom feed to extract paper metadata."""
-    try:
-        import feedparser
-    except ImportError:
-        sys.exit("pip install feedparser >=6.0")
-
-    feed = feedparser.parse(atom)
-    if not feed.entries:
-        raise ValueError("No entries in arXiv feed")
+def _parse_arxiv_metadata(paper: arxiv.Result) -> PaperMetadata:
+    """Parse arXiv paper result to extract paper metadata."""
+    authors = [author.name for author in paper.authors]
+    categories = paper.categories
     
-    entry = feed.entries[0]
-    authors = [author.name for author in getattr(entry, 'authors', [])]
-    categories = [tag.term for tag in getattr(entry, 'tags', [])]
+    # Extract arXiv ID from the entry_id URL
+    arxiv_id = paper.entry_id.split('/')[-1]
+    
+    # Generate citation in standard format
+    authors_str = ', '.join(authors[:3])  # First 3 authors
+    if len(authors) > 3:
+        authors_str += ' et al.'
+    
+    year = paper.published.year if paper.published else 'n.d.'
+    citation = f"{authors_str} ({year}). {paper.title}. arXiv preprint arXiv:{arxiv_id}."
     
     return PaperMetadata(
-        title=_normalize_whitespace(entry.title),
+        title=_normalize_whitespace(paper.title),
         authors=authors,
-        abstract=_normalize_whitespace(entry.summary),
-        published=getattr(entry, 'published', None),
-        categories=categories
+        abstract=_normalize_whitespace(paper.summary),
+        published=paper.published.isoformat() if paper.published else None,
+        categories=categories,
+        arxiv_id=arxiv_id,
+        citation=citation
     )
 
 
 def _normalize_whitespace(text: str) -> str:
     """Normalize whitespace in text."""
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _shuffle_mc_choices(question: MultipleChoiceQuestion) -> MultipleChoiceQuestion:
+    """Shuffle multiple choice answers to prevent all correct answers being 'A'."""
+    if len(question.choices) < 2:
+        return question  # Can't shuffle if less than 2 choices
+    
+    # Find the current correct choice
+    correct_choice = None
+    for choice in question.choices:
+        if choice.label == question.correct:
+            correct_choice = choice
+            break
+    
+    if not correct_choice:
+        return question  # Safety check
+    
+    # Create a list of choice texts (without labels)
+    choice_texts = [choice.text for choice in question.choices]
+    
+    # Shuffle the choice texts
+    random.shuffle(choice_texts)
+    
+    # Create new labels A, B, C, D...
+    labels = ['A', 'B', 'C', 'D', 'E', 'F'][:len(choice_texts)]
+    
+    # Create new choices with shuffled texts and sequential labels
+    new_choices = []
+    new_correct_label = 'A'  # Default fallback
+    
+    for i, text in enumerate(choice_texts):
+        label = labels[i]
+        new_choices.append(Choice(label=label, text=text))
+        
+        # Track which label now contains the correct answer
+        if text == correct_choice.text:
+            new_correct_label = label
+    
+    # Return new question with shuffled choices
+    return MultipleChoiceQuestion(
+        type=question.type,
+        prompt=question.prompt,
+        choices=new_choices,
+        correct=new_correct_label
+    )
 
 
 def _extract_pdf_text(pdf_path: Path) -> str:
@@ -273,53 +434,55 @@ def _extract_sections(text: str) -> Dict[str, str]:
     return sections
 
 
-async def _download_pdf(arxiv_id: str) -> Path:
-    """Download PDF from arXiv."""
-    pdf_url = f"{ARXIV_PDF_URL}/{arxiv_id}"
-    
-    async with httpx.AsyncClient(timeout=ARXIV_TIMEOUT) as client:
-        try:
-            response = await client.get(pdf_url)
-            response.raise_for_status()
-            
-            if len(response.content) > MAX_PDF_SIZE:
-                raise ValueError(f"PDF too large: {len(response.content)} bytes")
-            
-            # Create temporary file
-            temp_file = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-            temp_path = Path(temp_file.name)
-            
-            async with aiofiles.open(temp_path, 'wb') as f:
-                await f.write(response.content)
-            
-            return temp_path
-            
-        except httpx.HTTPError as exc:
-            logger.error(f"PDF download failed for {arxiv_id}: {exc}")
-            raise HTTPException(status_code=502, detail="Failed to download PDF") from exc
+async def _download_pdf(paper: arxiv.Result) -> Path:
+    """Download PDF from arXiv using arxiv.py."""
+    try:
+        # Create temporary file
+        temp_file = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+        temp_path = Path(temp_file.name)
+        temp_file.close()  # Close file handle before downloading
+        
+        # Download PDF using arxiv.py
+        paper.download_pdf(filename=str(temp_path))
+        
+        # Check file size
+        if temp_path.stat().st_size > MAX_PDF_SIZE:
+            temp_path.unlink()  # Clean up
+            raise ValueError(f"PDF too large: {temp_path.stat().st_size} bytes")
+        
+        return temp_path
+        
+    except Exception as exc:
+        logger.error(f"PDF download failed for {paper.entry_id}: {exc}")
+        # Clean up temp file if it exists
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+        raise HTTPException(status_code=502, detail="Failed to download PDF") from exc
 
 
 async def get_comprehensive_paper_content(arxiv_id: str) -> ProcessedPaper:
-    """Get comprehensive paper content including full PDF text."""
-    # First get basic metadata
-    async with httpx.AsyncClient(timeout=ARXIV_TIMEOUT) as client:
-        try:
-            r = await client.get(ARXIV_API_URL, params={"id_list": arxiv_id})
-            r.raise_for_status()
-        except httpx.HTTPError as exc:
-            logger.error("arXiv API error: %s", exc)
-            raise HTTPException(status_code=502, detail="arXiv API error") from exc
-    
+    """Get comprehensive paper content including full PDF text using arxiv.py."""
     try:
-        metadata = _parse_arxiv_metadata(r.text)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Search for the paper using arxiv.py
+        client = arxiv.Client()
+        search = arxiv.Search(id_list=[arxiv_id])
+        papers = list(client.results(search))
+        
+        if not papers:
+            raise HTTPException(status_code=404, detail=f"Paper {arxiv_id} not found")
+        
+        paper = papers[0]
+        metadata = _parse_arxiv_metadata(paper)
+        
+    except Exception as exc:
+        logger.error(f"arXiv search error for {arxiv_id}: {exc}")
+        raise HTTPException(status_code=502, detail="arXiv API error") from exc
     
     # Try to get full PDF content
     pdf_path = None
     try:
         logger.info(f"Downloading PDF for {arxiv_id}")
-        pdf_path = await _download_pdf(arxiv_id)
+        pdf_path = await _download_pdf(paper)
         
         logger.info(f"Extracting text from PDF: {pdf_path}")
         full_text = _extract_pdf_text(pdf_path)
@@ -739,7 +902,10 @@ def _validate_mc_questions(raw_response: str) -> List[MultipleChoiceQuestion]:
                 if question.correct not in choice_labels:
                     logger.warning(f"Skipping MC question {i+1}: correct answer not in choices")
                     continue
-                questions.append(question)
+                
+                # Shuffle choices to prevent all answers being 'A'
+                shuffled_question = _shuffle_mc_choices(question)
+                questions.append(shuffled_question)
             except ValidationError as e:
                 logger.error(f"Validation error for MC question {i+1}: {e}")
                 continue
@@ -849,12 +1015,572 @@ async def generate_questions(paper: ProcessedPaper, n_questions: int = 15, mc_qu
     return all_questions
 
 
+async def generate_exam_name(paper: ProcessedPaper, questions: List[Question], provider: str = "openai", model: str = "gpt-4o-mini", api_key: str = None) -> str:
+    """Generate a creative exam name using the LLM."""
+    
+    # Create a prompt for exam naming
+    system_prompt = """You are a creative academic assistant. Generate a concise, engaging exam title based on the paper content and questions.
+
+Requirements:
+- Maximum 6-8 words 
+- Academic but memorable
+- Captures the key concepts/themes
+- Should sound like a proper exam title
+- No quotes or special formatting needed
+
+Examples:
+- "Advanced Machine Learning Concepts Assessment"  
+- "Quantum Computing Fundamentals Examination"
+- "Neural Network Architecture Deep Dive"
+- "Computational Biology Methods Evaluation"
+
+Return only the exam title text, nothing else."""
+
+    # Extract key topics from paper and questions
+    topics = []
+    for question in questions[:5]:  # Use first 5 questions for topic extraction
+        if hasattr(question, 'prompt'):
+            topics.append(question.prompt[:100])  # First 100 chars
+    
+    topics_text = " ".join(topics)
+    
+    user_prompt = f"""Paper Title: {paper.metadata.title}
+Abstract: {paper.metadata.abstract[:300]}...
+Categories: {', '.join(paper.metadata.categories[:3])}
+Sample Question Topics: {topics_text[:500]}...
+
+Generate an engaging exam title for this assessment."""
+
+    if provider == "openai":
+        client = openai.AsyncOpenAI(api_key=api_key)
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                temperature=0.7,  # Higher temperature for creativity
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=30,  # Short response needed
+            )
+            
+            exam_name = response.choices[0].message.content.strip()
+            return exam_name
+            
+        except Exception as e:
+            logger.warning(f"Failed to generate exam name: {e}")
+            # Fallback to a simple name
+            main_category = paper.metadata.categories[0] if paper.metadata.categories else "Academic"
+            return f"{main_category.replace('cs.', 'Computer Science - ').title()} Assessment"
+    
+    else:
+        # For other providers, use a simple fallback for now
+        main_category = paper.metadata.categories[0] if paper.metadata.categories else "Academic" 
+        return f"{main_category.replace('cs.', 'Computer Science - ').title()} Assessment"
+
+
 # ---------------------------------------------------------------------------
-# API route
+# API routes
 # ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/api/test-paper/{arxiv_id}", tags=["Debug"])
+async def test_paper_processing(arxiv_id: str):
+    """Test endpoint to verify paper processing works."""
+    try:
+        paper = await get_comprehensive_paper_content(arxiv_id)
+        return {
+            "success": True,
+            "arxiv_id": arxiv_id,
+            "title": paper.metadata.title,
+            "authors": paper.metadata.authors[:3],
+            "processing_method": paper.processing_method,
+            "total_chars": paper.total_chars
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "arxiv_id": arxiv_id,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+
+
+@app.get("/api/search", response_model=SearchResponse, tags=["Search"])
+async def search_papers(
+    q: str = Query(..., description="Search query (supports field prefixes like 'au:', 'ti:', 'abs:', 'cat:')"),
+    max_results: int = Query(20, ge=1, le=100, description="Maximum number of results to return"),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    sort_by: Literal["relevance", "lastUpdatedDate", "submittedDate"] = Query("relevance", description="Sort order")
+) -> SearchResponse:
+    """Search arXiv papers with advanced query support."""
+    page_size = max_results
+    start = (page - 1) * page_size
+    
+    # Get one extra result to check if there are more pages
+    search_results = await search_arxiv_papers(
+        query=q,
+        max_results=page_size + 1,
+        sort_by=sort_by,
+        start=start
+    )
+    
+    has_more = len(search_results) > page_size
+    if has_more:
+        search_results = search_results[:page_size]
+    
+    return SearchResponse(
+        query=q,
+        total_results=len(search_results),  # Note: arxiv API doesn't provide total count
+        results=search_results,
+        page=page,
+        page_size=page_size,
+        has_more=has_more
+    )
+
+
+@app.get("/api/search/author/{author_name}", response_model=SearchResponse, tags=["Search"])
+async def search_by_author(
+    author_name: str,
+    max_results: int = Query(20, ge=1, le=100),
+    page: int = Query(1, ge=1),
+    sort_by: Literal["relevance", "lastUpdatedDate", "submittedDate"] = Query("submittedDate")
+) -> SearchResponse:
+    """Search papers by author name."""
+    query = f"au:{author_name}"
+    return await search_papers(q=query, max_results=max_results, page=page, sort_by=sort_by)
+
+
+@app.get("/api/search/category/{category}", response_model=SearchResponse, tags=["Search"])
+async def search_by_category(
+    category: str,
+    max_results: int = Query(20, ge=1, le=100),
+    page: int = Query(1, ge=1),
+    sort_by: Literal["relevance", "lastUpdatedDate", "submittedDate"] = Query("submittedDate"),
+    date_from: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    date_to: Optional[str] = Query(None, description="End date (YYYY-MM-DD)")
+) -> SearchResponse:
+    """Search papers by category with optional date filtering."""
+    query = f"cat:{category}"
+    
+    # Add date filtering if provided
+    if date_from or date_to:
+        # Convert to arXiv date format (YYYYMMDD)
+        date_filter_parts = []
+        if date_from:
+            try:
+                start_date = datetime.strptime(date_from, "%Y-%m-%d").strftime("%Y%m%d")
+                date_filter_parts.append(f"submittedDate:[{start_date}0000")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date_from format. Use YYYY-MM-DD")
+        else:
+            date_filter_parts.append("submittedDate:[19910101")
+            
+        if date_to:
+            try:
+                end_date = datetime.strptime(date_to, "%Y-%m-%d").strftime("%Y%m%d")
+                date_filter_parts.append(f"{end_date}2359]")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date_to format. Use YYYY-MM-DD")
+        else:
+            current_date = datetime.now().strftime("%Y%m%d")
+            date_filter_parts.append(f"{current_date}2359]")
+            
+        query += f" AND {''.join(date_filter_parts)}"
+    
+    return await search_papers(q=query, max_results=max_results, page=page, sort_by=sort_by)
+
+
+@app.get("/api/search/advanced", response_model=SearchResponse, tags=["Search"])
+async def advanced_search(
+    q: str = Query(..., description="Search query"),
+    categories: Optional[str] = Query(None, description="Comma-separated list of categories to filter by"),
+    min_date: Optional[str] = Query(None, description="Minimum publication date (YYYY-MM-DD)"),
+    max_date: Optional[str] = Query(None, description="Maximum publication date (YYYY-MM-DD)"),
+    authors: Optional[str] = Query(None, description="Comma-separated list of authors to include"),
+    exclude_categories: Optional[str] = Query(None, description="Comma-separated list of categories to exclude"),
+    max_results: int = Query(20, ge=1, le=100),
+    page: int = Query(1, ge=1),
+    sort_by: Literal["relevance", "lastUpdatedDate", "submittedDate"] = Query("relevance")
+) -> SearchResponse:
+    """Advanced search with multiple filters and criteria."""
+    # Build complex query
+    query_parts = [f"({q})"]
+    
+    # Add category filters
+    if categories:
+        cat_list = [cat.strip() for cat in categories.split(',')]
+        cat_query = " OR ".join([f"cat:{cat}" for cat in cat_list])
+        query_parts.append(f"({cat_query})")
+    
+    # Add author filters
+    if authors:
+        auth_list = [auth.strip() for auth in authors.split(',')]
+        auth_query = " OR ".join([f"au:{auth}" for auth in auth_list])
+        query_parts.append(f"({auth_query})")
+    
+    # Add date range
+    if min_date or max_date:
+        start_date = min_date or "1991-01-01"
+        end_date = max_date or datetime.now().strftime("%Y-%m-%d")
+        
+        try:
+            start_formatted = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y%m%d")
+            end_formatted = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y%m%d")
+            query_parts.append(f"submittedDate:[{start_formatted}0000 TO {end_formatted}2359]")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    
+    # Exclude categories
+    if exclude_categories:
+        excl_list = [cat.strip() for cat in exclude_categories.split(',')]
+        for cat in excl_list:
+            query_parts.append(f"NOT cat:{cat}")
+    
+    # Combine all parts
+    final_query = " AND ".join(query_parts)
+    
+    return await search_papers(q=final_query, max_results=max_results, page=page, sort_by=sort_by)
+
+
+@app.get("/api/search/similar/{arxiv_id}", response_model=SearchResponse, tags=["Search"])
+async def find_similar_papers(
+    arxiv_id: str,
+    max_results: int = Query(10, ge=1, le=50),
+    page: int = Query(1, ge=1)
+) -> SearchResponse:
+    """Find papers similar to a given arXiv paper based on categories and keywords."""
+    try:
+        # Get the reference paper
+        paper = await get_comprehensive_paper_content(arxiv_id)
+        
+        # Extract categories and key terms from title/abstract
+        categories = paper.metadata.categories[:3]  # Top 3 categories
+        title_words = paper.metadata.title.lower().split()
+        
+        # Build similarity query
+        cat_query = " OR ".join([f"cat:{cat}" for cat in categories])
+        
+        # Extract meaningful keywords from title (excluding common words)
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must'}
+        keywords = [word for word in title_words if len(word) > 3 and word not in stop_words][:5]
+        
+        if keywords:
+            keyword_query = " OR ".join([f"ti:{word}" for word in keywords])
+            query = f"({cat_query}) AND ({keyword_query}) AND NOT id_list:{arxiv_id}"
+        else:
+            query = f"({cat_query}) AND NOT id_list:{arxiv_id}"
+        
+        return await search_papers(q=query, max_results=max_results, page=page, sort_by="relevance")
+        
+    except Exception as e:
+        logger.error(f"Similar papers search error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to find similar papers")
+
+
+@app.get("/api/search/trending", response_model=SearchResponse, tags=["Search"])
+async def get_trending_papers(
+    category: Optional[str] = Query(None, description="Category to filter trending papers"),
+    days: int = Query(7, ge=1, le=30, description="Number of recent days to consider"),
+    max_results: int = Query(20, ge=1, le=100)
+) -> SearchResponse:
+    """Get trending/recent papers, optionally filtered by category."""
+    # Calculate date range
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+    
+    start_formatted = start_date.strftime("%Y%m%d")
+    end_formatted = end_date.strftime("%Y%m%d")
+    
+    # Build query
+    date_query = f"submittedDate:[{start_formatted}0000 TO {end_formatted}2359]"
+    
+    if category:
+        query = f"cat:{category} AND {date_query}"
+    else:
+        # Popular categories for trending
+        popular_cats = ["cs.AI", "cs.LG", "cs.CV", "cs.CL", "quant-ph", "physics.gr-qc"]
+        cat_query = " OR ".join([f"cat:{cat}" for cat in popular_cats])
+        query = f"({cat_query}) AND {date_query}"
+    
+    return await search_papers(q=query, max_results=max_results, page=1, sort_by="submittedDate")
+
+
+@app.get("/api/download/{arxiv_id}", tags=["Download"])
+async def download_paper_pdf(arxiv_id: str):
+    """Download PDF file for a specific arXiv paper."""
+    try:
+        logger.info(f"Downloading PDF for paper {arxiv_id}")
+        
+        # Search for the paper using arxiv.py
+        client = arxiv.Client()
+        search = arxiv.Search(id_list=[arxiv_id])
+        papers = list(client.results(search))
+        
+        if not papers:
+            raise HTTPException(status_code=404, detail=f"Paper {arxiv_id} not found")
+        
+        paper = papers[0]
+        
+        # Download PDF to temporary location
+        pdf_path = await _download_pdf(paper)
+        
+        # Read the PDF file
+        async with aiofiles.open(pdf_path, 'rb') as f:
+            pdf_content = await f.read()
+        
+        # Clean up temporary file
+        if pdf_path.exists():
+            pdf_path.unlink()
+        
+        # Generate filename
+        safe_title = re.sub(r'[^\w\s-]', '', paper.title)[:50]
+        safe_title = re.sub(r'[-\s]+', '-', safe_title).strip('-')
+        filename = f"{arxiv_id}_{safe_title}.pdf"
+        
+        # Return PDF with appropriate headers
+        from fastapi.responses import Response
+        return Response(
+            content=pdf_content,
+            media_type='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Length': str(len(pdf_content))
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading PDF for {arxiv_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download PDF") from e
+
+
+@app.post("/api/exam/selected", response_model=ExamResponse, tags=["Exam"])
+async def create_exam_from_selected_papers(
+    request: Request,
+    selected_request: SelectedPapersExamRequest
+) -> ExamResponse:
+    """Generate exam from specific selected papers by arXiv ID."""
+    # Extract LLM configuration from headers
+    provider = request.headers.get("X-LLM-Provider", "openai").lower()
+    model = request.headers.get("X-LLM-Model", "gpt-4o-mini")
+    api_key = request.headers.get("X-LLM-API-Key")
+    
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key is required. Please configure your LLM provider settings.")
+    
+    logger.info(f"Creating exam from {len(selected_request.arxiv_ids)} selected papers using {provider}/{model}")
+    
+    try:
+        # Get comprehensive content for each selected paper
+        papers = []
+        failed_papers = []
+        
+        for arxiv_id in selected_request.arxiv_ids:
+            try:
+                logger.info(f"Attempting to process paper {arxiv_id}")
+                
+                # Clean up the arXiv ID format if needed
+                clean_arxiv_id = arxiv_id.strip()
+                if not re.match(r'^\d{4}\.\d{4,5}$', clean_arxiv_id):
+                    logger.warning(f"Unusual arXiv ID format: {clean_arxiv_id}")
+                
+                paper = await get_comprehensive_paper_content(clean_arxiv_id)
+                papers.append(paper)
+                logger.info(f"Successfully processed paper {clean_arxiv_id} ({paper.processing_method})")
+            except HTTPException as e:
+                logger.warning(f"HTTP error processing paper {arxiv_id}: {e.detail}")
+                failed_papers.append(arxiv_id)
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error processing paper {arxiv_id}: {type(e).__name__}: {e}")
+                failed_papers.append(arxiv_id)
+                continue
+        
+        if not papers:
+            error_msg = f"Failed to process any of the selected papers. Failed papers: {failed_papers}"
+            if failed_papers:
+                error_msg += f". This could be due to invalid arXiv IDs, papers not found, or network issues."
+            raise HTTPException(status_code=404, detail=error_msg)
+        
+        if failed_papers:
+            logger.warning(f"Failed to process {len(failed_papers)} papers: {failed_papers}")
+        
+        # Combine all papers into a single "super paper" for exam generation
+        exam_title = selected_request.exam_title or f"Multi-Paper Exam ({len(papers)} papers)"
+        
+        combined_metadata = PaperMetadata(
+            title=exam_title,
+            authors=list(set([author for paper in papers for author in paper.metadata.authors])),
+            abstract=f"Exam generated from {len(papers)} selected papers: {', '.join([p.metadata.title[:50] + '...' if len(p.metadata.title) > 50 else p.metadata.title for p in papers[:3]])}",
+            categories=list(set([cat for paper in papers for cat in paper.metadata.categories]))
+        )
+        
+        # Combine content from all papers
+        combined_sections = {}
+        combined_text_parts = []
+        total_chars = 0
+        
+        for i, paper in enumerate(papers):
+            paper_prefix = f"PAPER {i+1}: {paper.metadata.title[:100]}..."
+            combined_text_parts.append(f"\n\n--- {paper_prefix} ---")
+            combined_text_parts.append(paper.full_text[:5000])  # Limit per paper to manage size
+            
+            # Merge sections with paper prefixes
+            for section_name, content in paper.sections.items():
+                section_key = f"paper_{i+1}_{section_name}"
+                combined_sections[section_key] = content[:2000]  # Limit section size
+            
+            total_chars += len(paper.full_text)
+        
+        combined_text = "\n".join(combined_text_parts)
+        
+        combined_paper = ProcessedPaper(
+            metadata=combined_metadata,
+            full_text=combined_text,
+            sections=combined_sections,
+            total_chars=total_chars, 
+            processing_method="pdf"
+        )
+        
+        # Generate questions
+        total_questions = selected_request.mc_questions + selected_request.oe_questions
+        questions = await generate_questions(
+            combined_paper, 
+            total_questions, 
+            selected_request.mc_questions, 
+            selected_request.oe_questions, 
+            provider, 
+            model, 
+            api_key
+        )
+        
+        # Generate exam name
+        exam_name = await generate_exam_name(combined_paper, questions, provider, model, api_key)
+        
+        mc_count = sum(1 for q in questions if q.type == "multiple_choice")
+        oe_count = len(questions) - mc_count
+        logger.info(f"Generated {mc_count} MC + {oe_count} OE questions from {len(papers)} selected papers")
+        logger.info(f"Generated exam name: '{exam_name}'")
+        
+        return ExamResponse(metadata=combined_metadata, questions=questions, exam_name=exam_name)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Unexpected error in selected papers exam generation: {e}")
+        raise HTTPException(status_code=500, detail="Internal error") from e
+
+
+@app.post("/api/exam/search", response_model=ExamResponse, tags=["Exam"])
+async def create_exam_from_search(
+    request: Request,
+    search_request: SearchExamRequest
+) -> ExamResponse:
+    """Generate exam from multiple papers found via search query."""
+    # Extract LLM configuration from headers
+    provider = request.headers.get("X-LLM-Provider", "openai").lower()
+    model = request.headers.get("X-LLM-Model", "gpt-4o-mini")
+    api_key = request.headers.get("X-LLM-API-Key")
+    
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key is required. Please configure your LLM provider settings.")
+    
+    logger.info(f"Creating exam from search: '{search_request.query}' with {search_request.max_papers} papers using {provider}/{model}")
+    
+    try:
+        # Search for papers
+        search_results = await search_arxiv_papers(
+            query=search_request.query,
+            max_results=search_request.max_papers,
+            sort_by=search_request.sort_by
+        )
+        
+        if not search_results:
+            raise HTTPException(status_code=404, detail="No papers found for the given search query")
+        
+        logger.info(f"Found {len(search_results)} papers for exam generation")
+        
+        # Get comprehensive content for each paper
+        papers = []
+        for result in search_results:
+            try:
+                paper = await get_comprehensive_paper_content(result.arxiv_id)
+                papers.append(paper)
+            except Exception as e:
+                logger.warning(f"Failed to process paper {result.arxiv_id}: {e}")
+                continue
+        
+        if not papers:
+            raise HTTPException(status_code=404, detail="Failed to process any papers from search results")
+        
+        # Combine all papers into a single "super paper" for exam generation
+        combined_metadata = PaperMetadata(
+            title=f"Multi-Paper Exam: {search_request.query}",
+            authors=list(set([author for paper in papers for author in paper.metadata.authors])),
+            abstract=f"Exam generated from {len(papers)} papers matching query: {search_request.query}",
+            categories=list(set([cat for paper in papers for cat in paper.metadata.categories]))
+        )
+        
+        # Combine content from all papers
+        combined_sections = {}
+        combined_text_parts = []
+        total_chars = 0
+        
+        for i, paper in enumerate(papers):
+            paper_prefix = f"PAPER {i+1}: {paper.metadata.title[:100]}..."
+            combined_text_parts.append(f"\n\n--- {paper_prefix} ---")
+            combined_text_parts.append(paper.full_text[:5000])  # Limit per paper to manage size
+            
+            # Merge sections with paper prefixes
+            for section_name, content in paper.sections.items():
+                section_key = f"paper_{i+1}_{section_name}"
+                combined_sections[section_key] = content[:2000]  # Limit section size
+            
+            total_chars += len(paper.full_text)
+        
+        combined_text = "\n".join(combined_text_parts)
+        
+        combined_paper = ProcessedPaper(
+            metadata=combined_metadata,
+            full_text=combined_text,
+            sections=combined_sections,
+            total_chars=total_chars, 
+            processing_method="pdf"
+        )
+        
+        # Generate questions
+        total_questions = search_request.mc_questions + search_request.oe_questions
+        questions = await generate_questions(
+            combined_paper, 
+            total_questions, 
+            search_request.mc_questions, 
+            search_request.oe_questions, 
+            provider, 
+            model, 
+            api_key
+        )
+        
+        # Generate exam name
+        exam_name = await generate_exam_name(combined_paper, questions, provider, model, api_key)
+        
+        mc_count = sum(1 for q in questions if q.type == "multiple_choice")
+        oe_count = len(questions) - mc_count
+        logger.info(f"Generated {mc_count} MC + {oe_count} OE questions from {len(papers)} papers")
+        logger.info(f"Generated exam name: '{exam_name}'")
+        
+        return ExamResponse(metadata=combined_metadata, questions=questions, exam_name=exam_name)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Unexpected error in search exam generation: {e}")
+        raise HTTPException(status_code=500, detail="Internal error") from e
+
 
 @app.get("/api/exam/{arxiv_id}", response_model=ExamResponse, tags=["Exam"])
 async def create_exam(
@@ -881,11 +1607,15 @@ async def create_exam(
         paper = await get_comprehensive_paper_content(arxiv_id)
         questions = await generate_questions(paper, total_questions, mc_questions, oe_questions, provider, model, api_key)
         
+        # Generate exam name
+        exam_name = await generate_exam_name(paper, questions, provider, model, api_key)
+        
         mc_count = sum(1 for q in questions if q.type == "multiple_choice")
         oe_count = len(questions) - mc_count
         logger.info(f"Generated {mc_count} MC + {oe_count} open-ended questions using {paper.processing_method}")
+        logger.info(f"Generated exam name: '{exam_name}'")
         
-        return ExamResponse(metadata=paper.metadata, questions=questions)
+        return ExamResponse(metadata=paper.metadata, questions=questions, exam_name=exam_name)
         
     except HTTPException:
         raise
@@ -906,7 +1636,7 @@ async def handle_exception(_: Request, exc: Exception) -> Response:
 def main() -> None:
     import uvicorn
     uvicorn.run(
-        "arxiv_exam_app:app",
+        "main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
         reload=bool(os.getenv("DEV")),

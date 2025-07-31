@@ -15,10 +15,129 @@
         </header>
         
         <main class="main-content">
-            <p class="description">
-                Enter an arXiv paper ID to generate a 10-question examination 
-                (7 multiple-choice + 3 open-ended) based on full paper analysis.
-            </p>
+            <!-- Search Mode Toggle -->
+            <div class="mode-toggle-section">
+                <div class="mode-toggle">
+                    <button class="mode-btn active" data-mode="single">Single Paper</button>
+                    <button class="mode-btn" data-mode="search">Search Papers</button>
+                </div>
+            </div>
+            
+            <!-- Single Paper Mode -->
+            <div class="mode-content" id="singlePaperMode">
+                <p class="description">
+                    Configure your LLM settings above, then enter an arXiv paper ID to generate a 10-question examination 
+                    (7 multiple-choice + 3 open-ended) based on full paper analysis.
+                </p>
+            </div>
+            
+            <!-- Search Mode -->
+            <div class="mode-content" id="searchMode" style="display: none;">
+                <p class="description">
+                    Search arXiv papers and generate exams from multiple related papers.
+                </p>
+                
+                <div class="search-options">
+                    <div class="search-type-tabs">
+                        <button class="search-tab active" data-search="general">General Search</button>
+                        <button class="search-tab" data-search="author">By Author</button>
+                        <button class="search-tab" data-search="category">By Category</button>
+                    </div>
+                    
+                    <!-- General Search -->
+                    <div class="search-panel active" id="generalSearch">
+                        <div class="search-input-group">
+                            <input type="text" id="generalQuery" placeholder="e.g., quantum machine learning, ti:transformer" class="search-input">
+                            <select id="generalSort" class="search-select">
+                                <option value="relevance">Sort by Relevance</option>
+                                <option value="submittedDate">Sort by Date</option>
+                                <option value="lastUpdatedDate">Sort by Last Updated</option>
+                            </select>
+                        </div>
+                        <div class="search-help">
+                            Use field prefixes: <code>au:</code> (author), <code>ti:</code> (title), <code>abs:</code> (abstract), <code>cat:</code> (category)
+                        </div>
+                    </div>
+                    
+                    <!-- Author Search -->
+                    <div class="search-panel" id="authorSearch">
+                        <div class="search-input-group">
+                            <input type="text" id="authorQuery" placeholder="e.g., Einstein, Hawking" class="search-input">
+                            <select id="authorSort" class="search-select">
+                                <option value="submittedDate">Sort by Date</option>
+                                <option value="relevance">Sort by Relevance</option>
+                                <option value="lastUpdatedDate">Sort by Last Updated</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <!-- Category Search -->
+                    <div class="search-panel" id="categorySearch">
+                        <div class="search-input-group">
+                            <select id="categorySelect" class="search-select">
+                                <option value="">Select Category</option>
+                                <option value="cs.AI">Computer Science - AI</option>
+                                <option value="cs.LG">Computer Science - Machine Learning</option>
+                                <option value="cs.CV">Computer Science - Computer Vision</option>
+                                <option value="cs.CL">Computer Science - Computation and Language</option>
+                                <option value="physics.gr-qc">Physics - General Relativity</option>
+                                <option value="quant-ph">Quantum Physics</option>
+                                <option value="math.CO">Mathematics - Combinatorics</option>
+                                <option value="stat.ML">Statistics - Machine Learning</option>
+                            </select>
+                            <select id="categorySort" class="search-select">
+                                <option value="submittedDate">Sort by Date</option>
+                                <option value="relevance">Sort by Relevance</option>
+                                <option value="lastUpdatedDate">Sort by Last Updated</option>
+                            </select>
+                        </div>
+                        <div class="date-filter">
+                            <label>Date Range:</label>
+                            <input type="date" id="dateFrom" class="date-input">
+                            <span>to</span>
+                            <input type="date" id="dateTo" class="date-input">
+                        </div>
+                    </div>
+                    
+                    <!-- Search Results -->
+                    <div class="search-results" id="searchResults" style="display: none;">
+                        <div class="results-header">
+                            <h3>Search Results</h3>
+                            <div class="results-controls">
+                                <div class="control-group">
+                                    <label>Max papers to select:</label>
+                                    <select id="maxPapers" class="small-select">
+                                        <option value="1">1 paper</option>
+                                        <option value="2">2 papers</option>
+                                        <option value="3" selected>3 papers</option>
+                                        <option value="4">4 papers</option>
+                                        <option value="5">5 papers</option>
+                                    </select>
+                                </div>
+                                <div class="control-group">
+                                    <label>MC Questions:</label>
+                                    <select id="mcQuestions" class="small-select">
+                                        <option value="5">5</option>
+                                        <option value="8">8</option>
+                                        <option value="10" selected>10</option>
+                                        <option value="12">12</option>
+                                    </select>
+                                    <label>Open-ended:</label>
+                                    <select id="oeQuestions" class="small-select">
+                                        <option value="3">3</option>
+                                        <option value="5" selected>5</option>
+                                        <option value="7">7</option>
+                                        <option value="8">8</option>
+                                    </select>
+                                </div>
+                                <button id="generateFromSearchBtn" class="search-exam-btn" disabled>Generate Exam from Selected (0)</button>
+                            </div>
+                        </div>
+                        <div class="results-list" id="resultsList"></div>
+                        <div class="pagination" id="pagination"></div>
+                    </div>
+                </div>
+            </div>
             
             <div class="teacher-mode-toggle">
                 <span class="teacher-mode-label">Teacher Mode</span>
@@ -31,7 +150,7 @@
             </div>
             
             <div class="llm-config-section">
-                <h3>LLM Configuration</h3>
+                <h3>LLM Configuration & Exam Generation</h3>
                 <div class="config-grid">
                     <div class="config-item">
                         <label for="llmProvider">Provider:</label>
@@ -55,18 +174,37 @@
                     </div>
                 </div>
                 <div class="config-status" id="configStatus"></div>
+                
+                <!-- Generate Exam Controls -->
+                <div class="exam-generation-controls" style="display: block;">
+                    <div class="exam-input-group">
+                        <input type="text" 
+                               id="arxivIdInput" 
+                               placeholder="e.g., 2406.01234" 
+                               aria-label="arXiv paper ID"
+                               class="arxiv-input">
+                        <button id="generateExamBtn" type="button" class="generate-btn">
+                            Generate Exam
+                        </button>
+                        <button id="downloadSinglePdfBtn" type="button" class="download-pdf-btn">
+                            📄 Download PDF
+                        </button>
+                    </div>
+                </div>
             </div>
             
-            <div class="input-section">
-                <input type="text" 
-                       id="arxivIdInput" 
-                       placeholder="e.g., 2406.01234" 
-                       aria-label="arXiv paper ID">
-                <button id="generateExamBtn" type="button">
-                    Generate Exam
+            <!-- Input Section - Single Paper Mode (now handled in LLM config) -->
+            <div class="input-section" id="singlePaperInput" style="display: none;">
+                <!-- Controls moved to LLM configuration section -->
+            </div>
+            
+            <!-- Search Button -->
+            <div class="input-section" id="searchInput" style="display: none;">
+                <button id="performSearchBtn" type="button" class="search-btn">
+                    Search Papers
                 </button>
             </div>
-            <button id="downloadExamBtn" style="display: none;">Download Exam (JSON)</button>
+            <button id="downloadExamBtn" style="display: none;">📥 Download Complete Exam Data</button>
             
             <div class="loading" id="loadingIndicator">
                 <div class="progress-container">
@@ -100,7 +238,11 @@
                         </div>
                         <div class="progress-step" id="step6">
                             <div class="step-icon">6</div>
-                            <div class="step-text">Finalizing exam</div>
+                            <div class="step-text">Finalizing and shuffling answers</div>
+                        </div>
+                        <div class="progress-step" id="step7">
+                            <div class="step-icon">7</div>
+                            <div class="step-text">Naming exam</div>
                         </div>
                     </div>
                 </div>
