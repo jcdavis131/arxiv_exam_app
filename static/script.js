@@ -783,6 +783,17 @@ class ExamApp {
 
             this.elements.examContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
             this.elements.downloadExamBtn.style.display = 'block'; // Show download button after generation
+            
+            // Track analytics event
+            if (window.va) {
+                window.va('track', 'Exam Generated', {
+                    paper_id: arxivId,
+                    exam_name: data.exam_name,
+                    question_count: data.questions.length,
+                    llm_provider: this.state.llmConfig.provider,
+                    mode: 'single_paper'
+                });
+            }
 
         } catch (error) {
             console.error('Exam generation error:', error);
@@ -1008,6 +1019,15 @@ class ExamApp {
             const data = await response.json();
             this.state.searchResults = data.results;
             this.displaySearchResults(data);
+            
+            // Track analytics event
+            if (window.va) {
+                window.va('track', 'Search Performed', {
+                    search_type: this.state.currentSearchType,
+                    results_count: data.results.length,
+                    query_length: query.length
+                });
+            }
 
         } catch (error) {
             console.error('Search error:', error);
@@ -1223,6 +1243,17 @@ class ExamApp {
             
             // Show download button
             this.elements.downloadExamBtn.style.display = 'block';
+            
+            // Track analytics event
+            if (window.va) {
+                window.va('track', 'Exam Generated', {
+                    paper_count: this.state.selectedPapers.length,
+                    exam_name: examData.exam_name,
+                    question_count: examData.questions.length,
+                    llm_provider: this.state.llmConfig.provider,
+                    mode: 'multi_paper'
+                });
+            }
 
         } catch (error) {
             console.error('Exam generation error:', error);
@@ -1361,6 +1392,16 @@ class ExamApp {
             URL.revokeObjectURL(url);
 
             console.log(`Downloaded enhanced exam data as ${filename}`);
+            
+            // Track analytics event
+            if (window.va) {
+                window.va('track', 'Exam Downloaded', {
+                    exam_name: examData.exam_name,
+                    paper_id: examData.metadata.arxiv_id,
+                    question_count: questions.length,
+                    llm_provider: this.state.llmConfig.provider
+                });
+            }
 
         } catch (error) {
             console.error('Error downloading exam data:', error);
@@ -1412,6 +1453,13 @@ class ExamApp {
             window.URL.revokeObjectURL(downloadUrl);
             
             console.log(`Successfully downloaded ${filename}`);
+            
+            // Track analytics event
+            if (window.va) {
+                window.va('track', 'PDF Downloaded', {
+                    paper_id: arxivId
+                });
+            }
             
         } catch (error) {
             console.error('Download error:', error);
